@@ -1,0 +1,9 @@
+diff --git a/data/lemonade.sysusers b/data/lemonade.sysusers
+index 42010aa0..7f1fcc22 100644
+--- a/data/lemonade.sysusers
++++ b/data/lemonade.sysusers
+@@ -1,2 +1,2 @@
+ #Type Name      ID  GECOS              Home directory     Shell
+-u     lemonade  -   "Lemonade Server"  /var/lib/lemonade  -
++u!    lemonade  -   "Lemonade Server"  /var/lib/lemonade  -
+

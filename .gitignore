@@ -1,0 +1,17 @@
+# Scratch directories in the repository root, rebuilt on demand and never pushed:
+#   src/   the checkout the workflow makes (and where a local `makepkg` clones upstream)
+#   out/   the built archives the workflow collects
+#   site/  the gh-pages clone the workflow publishes
+# There is a single PKGBUILD at the root, so there is exactly one src/ and one pkg/.
+/src/
+/pkg/
+/out/
+/site/
+
+# Build products, in case a build ever lands in the tracked tree.
+*.pkg.tar.*
+*.db.tar.gz
+*.files.tar.gz
+*.old
+*.SRCINFO
+*.log

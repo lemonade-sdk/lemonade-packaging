@@ -1,0 +1,27 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 311b19e3..42770ba7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1057,7 +1057,7 @@ if(CAN_BUILD_WEB_APP AND BUILD_WEB_APP)
+         endif()
+         install(FILES ${CMAKE_SOURCE_DIR}/src/app/assets/logo.svg
+             DESTINATION share/pixmaps
+-            RENAME lemonade-app.svg
++            RENAME lemonade-web-app.svg
+         )
+         # Create symlink in standard pixmaps path only if not installing to /usr
+         if(NOT CMAKE_INSTALL_PREFIX STREQUAL "/usr")
+diff --git a/data/lemonade-web-app.desktop b/data/lemonade-web-app.desktop
+index d872151f..769798d2 100644
+--- a/data/lemonade-web-app.desktop
++++ b/data/lemonade-web-app.desktop
+@@ -5,7 +5,7 @@ Name=Lemonade Web App
+ Comment=Local LLMs with GPU and NPU acceleration - Web Interface
+ GenericName=AI Model Manager
+ Exec=lemonade-web-app %u
+-Icon=lemonade-app
++Icon=lemonade-web-app
+ Terminal=false
+ Categories=Development;Utility;
+ Keywords=AI;LLM;GPU;NPU;Machine Learning;
+
