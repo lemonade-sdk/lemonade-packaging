@@ -4,12 +4,12 @@
 # Contributor: Michele Balistreri <michele@bitgamma.com>
 # Contributor: Caleb Maclennan <caleb@alerque.com>
 
-pkgbase=lemonade
+pkgbase=lemonade-next
 pkgname=(
-  lemonade-server
-  lemonade-desktop
+  lemonade-server-next
+  lemonade-desktop-next
 )
-pkgdesc='Lemonade helps users discover and run local AI apps by serving optimized LLMs right from their own GPUs and NPUs'
+pkgdesc='Lemonade helps users discover and run local AI apps by serving optimized LLMs right from their own GPUs and NPUs (pre-release version)'
 # Upstream is date based — year.week.number (release.md "Versioning",
 # https://github.com/lemonade-sdk/lemonade/discussions/3522). Release branches carry only
 # year.week and are named release-v<year>.<week>; every commit added to one since it was
@@ -19,11 +19,12 @@ pkgdesc='Lemonade helps users discover and run local AI apps by serving optimize
 DATE=2026.39
 COMMITS=1
 LEMONADE_RELEASE_BRANCH=release-v${DATE}
-pkgver=${DATE}.${COMMITS}rc
+pkgver=${DATE}.${COMMITS}
 pkgrel=1
 arch=(x86_64)
 url=https://github.com/lemonade-sdk/lemonade
 license=(Apache-2.0)
+options=('!debug')
 makedepends=(
   cargo
   cargo-tauri
@@ -82,7 +83,7 @@ build() {
   cargo tauri build --no-bundle
 }
 
-package_lemonade-server() {
+package_lemonade-server-next() {
   depends=(
     curl
     glibc
@@ -99,12 +100,14 @@ package_lemonade-server() {
     'fastflowlm: FLM support'
     'llama-cpp: Use system llama.cpp'
   )
+  provides=('lemonade-server')
+  conflicts=('lemonade-server')
   backup=(etc/default/lemond)
 
   DESTDIR="${pkgdir}" cmake --install build
 }
 
-package_lemonade-desktop() {
+package_lemonade-desktop-next() {
   depends=(
     cairo
     gdk-pixbuf2
@@ -115,6 +118,8 @@ package_lemonade-desktop() {
     libsoup3
     webkit2gtk-4.1
   )
+  provides=('lemonade-desktop')
+  conflicts=('lemonade-desktop')
 
   cd lemonade
   install -Dm 755 src/app/src-tauri/target/release/lemonade-app -t "${pkgdir}/usr/bin/"
