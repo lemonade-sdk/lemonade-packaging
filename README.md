@@ -2,7 +2,7 @@
 
 Builds Arch Linux packages with `makepkg`, indexes them into a pacman repository with
 `repo-add`, and publishes the result from the `gh-pages` branch so GitHub Pages serves it
-at `https://<owner>.github.io/lemonade-packaging/arch/`.
+at `https://lemonade-sdk.github.io/lemonade-packaging`.
 
 Everything runs in one workflow: [`.github/workflows/build-and-publish.yml`](.github/workflows/build-and-publish.yml).
 
@@ -11,7 +11,7 @@ Everything runs in one workflow: [`.github/workflows/build-and-publish.yml`](.gi
 ```ini
 # /etc/pacman.conf
 [lemonade]
-Server = https://<owner>.github.io/lemonade-packaging/arch/$arch
+Server = https://lemonade-sdk.github.io/lemonade-packaging/arch/$arch
 SigLevel = Never
 ```
 
@@ -201,7 +201,7 @@ would otherwise be rejected by the remote as a non-fast-forward.
 
 * `SOURCE_DATE_EPOCH` makes archives reproducible, but `repo-add` does not honour it for its
   own timestamps — that is what the “unchanged” restore in step 7 is for.
-* GitHub Pages serves `https://<owner>.github.io/<repo>/arch/x86_64/lemonade.db` because
+* GitHub Pages serves `https://lemonade-sdk.github.io/lemonade-packaging/arch/x86_64/lemonade.db` because
   `repo-add` leaves `lemonade.db` as a symlink to `lemonade.db.tar.gz`; git stores it as a
   symlink and Pages serves it as a file. Both URLs work.
 * The repository is unsigned (`SigLevel = Never`). pacman warns; that is expected until
