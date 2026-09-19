@@ -1,0 +1,518 @@
+# ==============================================================================
+#  lemonade-packaging — build Arch packages and serve them as an unofficial repo
+# ==============================================================================
+#
+#  What one run does:
+#
+#    1. install an Arch toolchain + an unprivileged build user (makepkg refuses root)
+#    2. check out this repository
+#    3. build the PKGBUILD at the repository root -> out/x86_64/*.pkg.tar.zst
+#    4. on the weekly run: follow upstream's current release branch — rewrite DATE and
+#       COMMITS (and the b2sums entry that covers them) in that PKGBUILD before it is
+#       built, and push that change back to the default branch once the build succeeded
+#    5. restore whatever is already published on gh-pages, creating it if absent
+#    6. create the pacman database if missing, otherwise update it (repo-add)
+#    7. verify that the database and the files on the disk agree
+#    8. push the tree to the `gh-pages` branch
+#
+#  Layout you maintain in this repository (there is exactly one PKGBUILD, at the root):
+#
+#    PKGBUILD                      pkgbase=lemonade, builds lemonade-server + lemonade-desktop
+#    *.patch                       the patches it applies in prepare()
+#
+#  Layout published on the gh-pages branch (what users download):
+#
+#    .nojekyll
+#    arch/index.html
+#    arch/x86_64/lemonade.db            -> lemonade.db.tar.gz  (symlink made by repo-add)
+#    arch/x86_64/lemonade.db.tar.gz     the pacman database
+#    arch/x86_64/lemonade-<ver>-<rel>-x86_64.pkg.tar.zst
+#
+#  What your users add to /etc/pacman.conf ($arch is substituted by pacman):
+#
+#    [lemonade]
+#    Server = https://lemonade-sdk.github.io/lemonade-packaging/arch/$arch
+#    SigLevel = Never
+#
+#  Everything below is a native binary (git, pacman, makepkg, bsdtar): no
+#  JavaScript actions run inside the Arch container, because those need a
+#  Node.js runtime inside the image and archlinux images do not ship one.
+#
+#  One-time GitHub setting: Settings → Pages → Source: "Deploy from a branch",
+#  branch `gh-pages`, folder `/ (root)`. (See README.md for the alternative
+#  "deploy via actions/deploy-pages" wiring.)
+# ==============================================================================
+name: build-and-publish
+run-name: "${{ github.ref_name }} → Lemonade ${{ github.event.inputs.lemonade_version || 'newest release branch' }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      lemonade_version:
+        description: Pin DATE/COMMITS to this release (year.week[.number]; empty = newest upstream release branch)
+        required: false
+        default: ''
+        type: string
+      force_bump:
+        description: Rewrite and re-checksum the PKGBUILD even if DATE/COMMITS are unchanged
+        required: false
+        default: false
+        type: boolean
+      rebuild_db:
+        description: Discard the existing pacman database and re-index every archive on disk
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: [ main ]
+    paths:
+      - 'PKGBUILD'
+      - '*.patch'
+      - '.github/workflows/build-and-publish.yml'
+  pull_request:
+    # Pull requests run the whole pipeline, including repo-add, but never push.
+    paths:
+      - 'PKGBUILD'
+      - '*.patch'
+      - '.github/workflows/build-and-publish.yml'
+  schedule:
+    # Weekly. Upstream cuts release-v<year>.<week> from main at its release cutoff —
+    # Wednesdays 16:00 UTC (see release.md, "Release Cadence and Channels"). 16:30 UTC is
+    # the first slot after that cut, so a run resolves the branch that has just been
+    # created, at .0. A run before the cut would resolve last week's branch instead. The
+    # Thursday slot below is kept for those who prefer a day of slack around the cut.
+    #- cron: '0 15 * * 4'
+    - cron: "30 16 * * 3"
+
+# Least privilege by default; the job below raises it for the single push it makes.
+permissions:
+  contents: read
+
+# Runs rewrite the gh-pages branch, so two runs must never overlap.
+concurrency:
+  group: arch-repo-publish
+  cancel-in-progress: false
+
+jobs:
+  arch-repo:
+    name: build packages and publish the repo
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write # required to push the gh-pages branch
+    container:
+      # Official Arch image (multi-arch). To publish aarch64 too, run a second job on
+      # an arm64 runner or add docker/setup-qemu-action + a cross-built image.
+      image: ghcr.io/archlinux/archlinux:latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      REPO_NAME: lemonade # must match the [repo] header users write in pacman.conf
+      PAGES_DIR: arch # the directory under https://lemonade-sdk.github.io/lemonade-packacing/
+      ARCH: x86_64
+      PKGEXT: '.pkg.tar.zst'
+      UPSTREAM_REPO: lemonade-sdk/lemonade # where the weekly release branches come from
+      UPSTREAM_BRANCH: main # the branch release-v<year>.<week> is cut from: the compare base
+      PUSH_BRANCH: main # must match on.push.branches; the branch a bump commit may be pushed to
+      #SRCDEST: ${{ runner.temp }}/srcdest # clone cache shared by updpkgsums and makepkg
+      REMOTE: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+      OWNER: ${{ github.repository_owner }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      GIT_TERMINAL_PROMPT: "0" # never wait for an interactive credential prompt
+
+    steps:
+      - name: Install the Arch build toolchain
+        run: |
+          set -euo pipefail
+          # Refresh the keyring first, or the mirror's signatures can look stale.
+          pacman -Sy --noconfirm archlinux-keyring
+          # curl asks the API which release is current; pacman-contrib brings updpkgsums,
+          # which rewrites the checksum arrays after the version line moves.
+          pacman -Su --noconfirm --needed base-devel curl git pacman-contrib sudo
+
+      - name: Create an unprivileged build user
+        run: |
+          set -euo pipefail
+          # makepkg refuses to run as root, and the arch image's default user is root.
+          # `makepkg -s` installs makedepends through sudo, hence the NOPASSWD line.
+          useradd -m build
+          printf '%s\n' 'build ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/build
+          chmod 0440 /etc/sudoers.d/build
+          # Cloned as root, built as `build`: stop git's "dubious ownership" complaints.
+          git config --system --add safe.directory '*'
+
+      - name: Check out ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Plain git instead of actions/checkout: JS actions need Node.js inside the
+          # container. Use the "GitHub Actions Pages backend" variant in README.md if
+          # you would rather install nodejs in the image.
+          git init -q src
+          git -C src remote add origin "$REMOTE"
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            ref="refs/pull/${PR_NUMBER}/merge"   # exactly the tree GitHub would merge
+          else
+            ref="$GITHUB_REF"
+          fi
+          # A scheduled/dispatch run may push a version-bump commit back (see "Push the
+          # version bump"), and git will not let you push out of a shallow clone. This
+          # repository only ever holds recipes and patches, so fetch it whole when the run
+          # is one that can push, and stay shallow for the rest.
+          if [[ "$GITHUB_EVENT_NAME" == schedule || "$GITHUB_EVENT_NAME" == workflow_dispatch ]] \
+             && [[ "$GITHUB_REF_NAME" == "$PUSH_BRANCH" ]]; then
+            git -C src fetch -q origin "$ref"
+          else
+            git -C src fetch -q --depth 1 origin "$ref"
+          fi
+          git -C src checkout -q --detach FETCH_HEAD
+          git -C src log --oneline -1
+          chown -R build:build src
+          # Clone cache for the upstream sources: updpkgsums clones the release branch into
+          # it and the build then reuses that clone instead of downloading the world a
+          # second time.
+          install -d "$RUNNER_TEMP/srcdest"
+          chown build:build "$RUNNER_TEMP/srcdest"
+          # Reproducible builds: stamp packages with the commit time, not the wall clock.
+          # This also keeps the published database byte-identical when nothing changed,
+          # so the weekly schedule does not create noise commits on gh-pages.
+          echo "SOURCE_DATE_EPOCH=$(git -C src log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+      # ----------------------------------------------------------------------------
+      #  This repository holds exactly one PKGBUILD and it sits at its root, so there is
+      #  nothing to discover and no per-subdirectory filter to honour. The check costs one
+      #  stat and turns a wrong-branch/wrong-layout checkout into a clear error instead of
+      #  a confusing makepkg failure several minutes later.
+      # ----------------------------------------------------------------------------
+      - name: Check that the PKGBUILD is at the repository root
+        run: |
+          set -euo pipefail
+          [[ -f src/PKGBUILD ]] \
+            || { echo "::error::src/PKGBUILD is missing — this repository builds exactly one PKGBUILD, at its root."; exit 1; }
+          grep -q '^pkgbase=' src/PKGBUILD \
+            || echo "::warning::src/PKGBUILD declares no pkgbase (a split PKGBUILD is expected here)"
+
+      # ----------------------------------------------------------------------------
+      #  Lemonade versions are date based — year.week.number (release.md "Versioning",
+      #  RFC 3522). year.week lives in the branch name (release-v<year>.<week>) and the
+      #  number is how many commits that branch has picked up since it was cut, starting
+      #  at 0 — so the answer is upstream's *branch*, not a tag: candidates are never
+      #  tagged (only the promoted one is, and pkgver carries an `rc` precisely because
+      #  this repository builds the branch tip). Ask git for the newest release branch,
+      #  ask the compare API how far ahead of main it is, and write both halves of the
+      #  version into the PKGBUILD.
+      #
+      #  Both lookups are unauthenticated on purpose: GITHUB_TOKEN is scoped to *this*
+      #  repository and cannot read ${UPSTREAM_REPO}'s. ls-remote costs no API quota and
+      #  the single compare request a week stays far under the 60 req/h anonymous limit.
+      #
+      #  The bump has to happen here, before the build, rather than in a workflow that
+      #  pushes to main and waits to be re-triggered: pushes made with GITHUB_TOKEN
+      #  never start a new run, so a bump-only commit would sit un-built for a week.
+      # ----------------------------------------------------------------------------
+      - name: Bump DATE and COMMITS to the current Lemonade release branch
+        id: bump
+        if: >-
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.ref_name == 'main'
+        env:
+          PIN: ${{ github.event.inputs.lemonade_version }}
+          FORCE: ${{ github.event.inputs.force_bump }}
+        run: |
+          set -euo pipefail
+          for var in DATE COMMITS; do
+            grep -q "^${var}=" src/PKGBUILD \
+              || { echo "The PKGBUILD declares no ${var} — nothing to track."; exit 0; }
+          done
+          cur_date="$(sed -n 's|^DATE=\([^[:space:]]*\).*|\1|p' src/PKGBUILD | head -1)"
+          cur_commits="$(sed -n 's|^COMMITS=\([^[:space:]]*\).*|\1|p' src/PKGBUILD | head -1)"
+          if [[ -n ${PIN// /} ]]; then
+            pin="${PIN// /}"
+            pin="${pin#v}"
+            if [[ $pin =~ ^[0-9]{4}\.[0-9]{1,2}\.[0-9]{1,2}$ ]]; then
+              new_date="${pin%.*}"; new_commits="${pin##*.}"
+            elif [[ $pin =~ ^[0-9]{4}\.[0-9]{1,2}$ ]]; then
+              new_date="$pin"; new_commits=0
+            else
+              echo "::error::lemonade_version must be year.week or year.week.number (got '${PIN}')"
+              exit 1
+            fi
+            echo "Pinned to ${new_date}.${new_commits} by the lemonade_version input."
+          else
+            # Newest release-v<year>.<week> branch. sort -V copes with the year rollover
+            # (2026.52 → 2027.1); anything shaped differently is not a release branch.
+            new_date="$(git ls-remote --heads "https://github.com/${UPSTREAM_REPO}.git" \
+                          'refs/heads/release-v*' \
+                        | sed -n 's|.*refs/heads/release-v\([0-9]\{4\}\.[0-9]\{1,2\}\)$|\1|p' \
+                        | sort -V | tail -1)" || new_date=''
+            if [[ ! $new_date =~ ^[0-9]{4}\.[0-9]{1,2}$ ]]; then
+              echo "::warning::could not resolve a current ${UPSTREAM_REPO} release branch (got '${new_date:-nothing}'); building what is committed (${cur_date}.${cur_commits})"
+              exit 0
+            fi
+            # number = commits added to that branch since it was created. The three-dot
+            # compare starts at the merge base, so total_commits counts exactly what the
+            # branch gained after the cut — a cherry-picked hotfix is one such commit.
+            new_commits="$(curl -fsS --connect-timeout 10 --retry 3 --retry-delay 15 \
+                             -H 'Accept: application/vnd.github+json' \
+                             "${GITHUB_API_URL:-https://api.github.com}/repos/${UPSTREAM_REPO}/compare/${UPSTREAM_BRANCH}...release-v${new_date}" \
+                           | grep -o '"total_commits"[[:space:]]*:[[:space:]]*[0-9]\{1,\}' \
+                           | head -1 | grep -o '[0-9]\{1,\}$')" || new_commits=''
+            if [[ ! $new_commits =~ ^[0-9]+$ ]]; then
+              echo "::warning::could not count the commits on release-v${new_date} (got '${new_commits:-nothing}'); building what is committed (${cur_date}.${cur_commits})"
+              exit 0
+            fi
+            echo "Newest ${UPSTREAM_REPO} release branch: release-v${new_date}, ${new_commits} commit(s) past the cut."
+          fi
+          if [[ $new_date == "$cur_date" && $new_commits == "$cur_commits" \
+                && ${FORCE:-false} != 'true' ]]; then
+            echo "The PKGBUILD already tracks ${cur_date}.${cur_commits} — nothing to do."
+            exit 0
+          fi
+          # As the build user, not as root: sed -i replaces the file, and a root-owned
+          # PKGBUILD would then be unwritable by the updpkgsums below it.
+          sudo -u build sed -i -E \
+            "s|^DATE=.*|DATE=${new_date}|; s|^COMMITS=.*|COMMITS=${new_commits}|" src/PKGBUILD
+          # Those two variables move the branch checkout to a different commit, and that
+          # checkout is hashed content: its b2sums entry is wrong from then on and makepkg
+          # refuses to build. Regenerate them (patch checksums included). The clone lands
+          # in SRCDEST, which the build step then reuses.
+          if ! sudo -u build HOME=/home/build SRCDEST="$RUNNER_TEMP/srcdest" \
+                 updpkgsums "$GITHUB_WORKSPACE/src/PKGBUILD"; then
+            echo "::error::updpkgsums failed — could not fetch/handle release-v${new_date}; leaving the PKGBUILD untouched"
+            git -C src checkout -- PKGBUILD
+            exit 1
+          fi
+          if git -C src diff --quiet; then
+            echo "The rewritten PKGBUILD is byte-identical to what is committed."
+            exit 0
+          fi
+          git -C src --no-pager diff --stat
+          {
+            echo "## Lemonade ${cur_date}.${cur_commits} → ${new_date}.${new_commits}"
+            echo
+            echo "- \`DATE\`/\`COMMITS\` updated in \`PKGBUILD\`: \`release-v${new_date}\` at \`+${new_commits}\`, i.e. \`pkgver=${new_date}.${new_commits}rc\`."
+            echo "- Checksums regenerated with \`updpkgsums\` (the \`git+…#branch=…\` source included)."
+            echo "- Committed back to \`main\` at the end of this run, once the packages are published."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "old=${cur_date}.${cur_commits}" >> "$GITHUB_OUTPUT"
+          echo "new=${new_date}.${new_commits}" >> "$GITHUB_OUTPUT"
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+
+      - name: Build the packages
+        id: build
+        run: |
+          set -euo pipefail
+          install -d "out/$ARCH"
+          # The one PKGBUILD is a split one (pkgbase=lemonade), so this builds an archive
+          # per pkgname plus the debug packages makepkg peels off. Failing here fails the
+          # run: there is nothing else to publish, and the bump must not land either.
+          ( cd src \
+            && sudo -u build HOME=/home/build PKGEXT="$PKGEXT" SRCDEST="$RUNNER_TEMP/srcdest" \
+                 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-0}" \
+                 makepkg -sc --noconfirm )
+          if ! compgen -G "src/*.pkg.tar.*" > /dev/null; then
+            echo "::error::makepkg exited 0 but left no archive in src/; the published repository is left untouched"
+            exit 1
+          fi
+          mv -f src/*.pkg.tar.* "out/$ARCH/"
+          ls -l "out/$ARCH"
+
+      - name: Restore the tree currently published on GitHub Pages
+        run: |
+          set -euo pipefail
+          # A pacman database references package files by name, so the packages already
+          # published must be present when we update the database and push again.
+          if git ls-remote --exit-code --heads "$REMOTE" gh-pages > /dev/null 2>&1; then
+            echo "gh-pages branch found — restoring the published repository"
+            # Shallow is fine: we only ever push one commit on top of the fetched tip.
+            git clone -q --depth 1 --branch gh-pages "$REMOTE" site
+            [[ -e "site/$PAGES_DIR/$ARCH/$REPO_NAME.db.tar.gz" ]] \
+              && echo "found an existing database" \
+              || echo "no database for $REPO_NAME/$ARCH yet — repo-add will create one"
+          else
+            echo "no gh-pages branch yet — starting empty; repo-add will create the database"
+            install -d site
+          fi
+          install -d "site/$PAGES_DIR/$ARCH"
+          touch site/.nojekyll   # GitHub Pages must not run Jekyll over binary archives
+
+      - name: Create or update the pacman database
+        env:
+          REBUILD_DB: ${{ github.event.inputs.rebuild_db }}
+        run: |
+          set -euo pipefail
+          target="site/$PAGES_DIR/$ARCH"
+          db="$target/$REPO_NAME.db.tar.gz"
+          install -d "$target"
+          # Snapshot the published databases first: repo-add re-stamps its output with the
+          # current time, so a run that changes nothing would still look like a change.
+          pre="$RUNNER_TEMP/published-db"
+          install -d "$pre"
+          cp -a "$target"/*.tar.gz "$pre"/ 2> /dev/null || true
+          cp -f "out/$ARCH"/*.pkg.tar.* "$target/"
+          if [[ "$REBUILD_DB" == 'true' ]]; then
+            echo "rebuild_db requested — dropping the old $REPO_NAME database"
+            rm -f "$db" "$target/$REPO_NAME.db" "$target/$REPO_NAME.files" \
+                  "$target/$REPO_NAME.files.tar.gz"
+          fi
+          [[ -e "$db" ]] && echo "updating existing database: $db" \
+                         || echo "database absent — repo-add will create: $db"
+          # -p: do not replace a newer version that is already published
+          # -R: delete archives that this run supersedes, so the tree does not grow forever
+          LC_ALL=C repo-add -p -R "$db" "$target"/*.pkg.tar.*
+          # repo-add leaves .old backups of the previous database; never publish those.
+          find site -name '*.old' -delete
+          # Put the published bytes back whenever repo-add produced the same entries, so an
+          # unchanged repository produces no gh-pages commit at all.
+          for snap in "$pre"/*.tar.gz; do
+            [[ -e "$snap" ]] || continue
+            cur="$target/${snap##*/}"
+            if [[ -e "$cur" ]] \
+               && [[ "$(LC_ALL=C bsdtar -xOf "$snap" | sort)" == "$(LC_ALL=C bsdtar -xOf "$cur" | sort)" ]]; then
+              echo "unchanged: $cur"
+              cp -a "$snap" "$cur"
+            fi
+          done
+
+      - name: Verify the database against the published files
+        run: |
+          set -euo pipefail
+          target="site/$PAGES_DIR/$ARCH"
+          db="$target/$REPO_NAME.db.tar.gz"
+          [[ -e "$db" ]] || { echo "::error::$db was not created"; exit 1; }
+          # %FILENAME% is the name pacman will be told to download; it must exist on disk.
+          mapfile -t listed < <(LC_ALL=C bsdtar -xOf "$db" \
+            | awk '/^%FILENAME%$/{getline; if (length) print}' | sort)
+          if (( ${#listed[@]} == 0 )); then
+            echo "::error::$db lists no package; nothing was added"
+            exit 1
+          fi
+          status=0
+          echo "$db lists ${#listed[@]} package(s):"
+          for f in "${listed[@]}"; do
+            if [[ -f "$target/$f" ]]; then
+              echo "  ok  $f"
+            else
+              echo "::error::$f is listed in the database but is missing from $target"
+              status=1
+            fi
+          done
+          # Drop archives no database entry points at (e.g. a build repo-add refused
+          # because a newer version is already published). Keeps the tree honest.
+          for f in "$target"/*.pkg.tar.*; do
+            [[ -e "$f" ]] || continue
+            if ! printf '%s\n' "${listed[@]}" | grep -qxF -- "${f##*/}"; then
+              echo "::warning::removing archive not present in the database: ${f##*/}"
+              rm -f "$f" "$f.sig"
+            fi
+          done
+          exit $status
+
+      - name: Render a human-readable index for the Pages directory
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          base="https://${OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+          {
+            echo '<!doctype html>'
+            echo '<html lang="en"><head><meta charset="utf-8">'
+            echo "<title>${REPO_NAME} — unofficial Arch Linux repository</title>"
+            echo '<style>body{font-family:system-ui,sans-serif;max-width:52rem;margin:2rem auto;padding:0 1rem}'
+            echo 'pre{background:#f4f4f4;padding:.75rem;overflow-x:auto}h2{margin-top:2rem}</style></head><body>'
+            echo "<h1>${REPO_NAME}</h1>"
+            echo "Unofficial Arch Linux repository for <code>${GITHUB_REPOSITORY#*/}</code>, rebuilt by GitHub Actions."
+            echo "<p>Add this to <code>/etc/pacman.conf</code>, then run <code>sudo pacman -Sy</code>:</p>"
+            printf '<pre>[%s]\nServer = %s/%s/$arch\nSigLevel = Never</pre>\n' \
+              "$REPO_NAME" "$base" "$PAGES_DIR"
+            echo '<h2>Packages</h2>'
+            for d in "site/$PAGES_DIR"/*/; do
+              a="$(basename "$d")"
+              echo "<h3>${a}</h3><ul>"
+              for f in "$d"*.pkg.tar.*; do
+                n="${f##*/}"
+                if [[ "$n" == *.sig ]]; then continue; fi
+                printf '<li><a href="%s">%s</a> (%s)</li>\n' "$a/$n" "$n" \
+                  "$(numfmt --to=iec --suffix=B -- "$(stat -c%s "$f")")"
+              done
+              echo '</ul>'
+            done
+            # Keep this footer stable (no run id): a byte-identical index lets the publish
+            # step skip commits when nothing in the repository actually changed.
+            echo "<p>Rebuilt by GitHub Actions from <code>${GITHUB_REF_NAME}</code>.</p>"
+            echo '</body></html>'
+          } > "site/index.html"
+          echo "wrote site/index.html"
+
+      - name: Publish to GitHub Pages (gh-pages branch)
+        if: github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          cd site
+          if [[ -d .git ]]; then
+            git remote set-url origin "$REMOTE"
+          else
+            git init -q -b gh-pages
+            git remote add origin "$REMOTE"
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Published tree is unchanged — nothing to push."
+          else
+            git commit -q \
+              -m "arch: update ${REPO_NAME} repository [skip ci]" \
+              -m "source: ${GITHUB_REF_NAME} @ ${GITHUB_SHA}" \
+              -m "run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            git push -q origin 'HEAD:refs/heads/gh-pages'
+            echo "Pushed gh-pages."
+          fi
+
+      # ----------------------------------------------------------------------------
+      #  Land the bump. Only once a package built from it, so `main` never points at a
+      #  version this repository cannot build: a failed week is simply retried by the
+      #  next run, which resolves the same release again.
+      # ----------------------------------------------------------------------------
+      - name: Push the version bump to ${{ github.ref_name }}
+        id: push-bump
+        if: steps.bump.outputs.changed == 'true' && steps.build.outcome == 'success'
+        env:
+          OLD: ${{ steps.bump.outputs.old }}
+          NEW: ${{ steps.bump.outputs.new }}
+        run: |
+          set -euo pipefail
+          cd src
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- PKGBUILD
+          git commit -q \
+            -m "chore: Lemonade release ${OLD:-unset} -> ${NEW} [skip ci]" \
+            -m "Resolved from the newest ${UPSTREAM_REPO} release branch: release-v${NEW%.*} at ${NEW##*.} commit(s) past the cut." \
+            -m "run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          if ! git push -q origin "HEAD:refs/heads/${PUSH_BRANCH}"; then
+            echo "::warning::${PUSH_BRANCH} moved while this run was building — rebasing the bump, retrying once"
+            git fetch -q origin "$PUSH_BRANCH"
+            if ! git rebase -q FETCH_HEAD; then
+              git rebase --abort || true
+              echo "::error::the bump conflicts with what landed on ${PUSH_BRANCH}; not pushed, re-run once resolved"
+              exit 1
+            fi
+            git push -q origin "HEAD:refs/heads/${PUSH_BRANCH}"
+          fi
+          echo "Pushed the PKGBUILD tracking release-v${NEW%.*}.${NEW##*.} to ${PUSH_BRANCH}."
+
+      - name: Report
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## ${REPO_NAME} repository"
+            echo
+            n="$(find "out/$ARCH" -name '*.pkg.tar.*' ! -name '*.sig' 2> /dev/null | wc -l)"
+            rel_date="$(sed -n 's|^DATE=\([^[:space:]]*\).*|\1|p' src/PKGBUILD | head -1)"
+            rel_commits="$(sed -n 's|^COMMITS=\([^[:space:]]*\).*|\1|p' src/PKGBUILD | head -1)"
+            echo "- Built into \`out/$ARCH\`: ${n} archive(s)"
+            echo "- Tracking Lemonade \`release-v${rel_date:-unknown}\` at \`+${rel_commits:-?}\` (\`pkgver=${rel_date:-?}.${rel_commits:-?}rc\`)"
+            echo "- Database: \`$PAGES_DIR/$ARCH/$REPO_NAME.db.tar.gz\`"
+            echo "- Server line: \`Server = https://${OWNER}.github.io/${GITHUB_REPOSITORY#*/}/$PAGES_DIR/\$arch\`"
+            echo "- Publish step is skipped on pull requests."
+          } >> "$GITHUB_STEP_SUMMARY"
