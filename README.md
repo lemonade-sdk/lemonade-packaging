@@ -16,7 +16,7 @@ SigLevel = Never
 ```
 
 ```console
-$ sudo pacman -Sy && sudo pacman -S <pkgname>
+$ sudo pacman -Sy && sudo pacman -S lemonade-server-next lemonade-desktop-next
 ```
 
 `$arch` is substituted by pacman, so one `Server` line covers every architecture you
