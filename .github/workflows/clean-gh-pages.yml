@@ -1,0 +1,445 @@
+# ==============================================================================
+#  lemonade-packaging — prune leftovers out of the published gh-pages tree
+# ==============================================================================
+#
+#  build-and-publish keeps the repository current, but the tree it publishes to
+#  `gh-pages` is append-only in practice, and a few kinds of debris survive:
+#
+#    * packages whose name no longer exists — a rename (lemonade-server →
+#      lemonade-server-next), a scratch name tried once, or
+#      `lemonade-debug-2026.39.1rc-1-x86_64.pkg.tar.zst`, which was built before
+#      options=('!debug') was added to the PKGBUILD. Those stay downloadable
+#      forever, and `pacman -Syyu` will happily offer them right next to the real
+#      packages because they sit in the same database.
+#    * archives that sit in arch/x86_64/ but are not in the pacman database: a run
+#      that died between `repo-add` and `git push`, or one where `repo-add -p`
+#      refused an archive because a newer version was already indexed. A client can
+#      never see those, so they are pure bandwidth cost.
+#    * the droppings those files leave beside them — `.sig` for an archive that is
+#      gone, `*.old` database backups.
+#
+#  Rules, in one line: the database is the source of truth for what belongs in
+#  arch/<arch>/, and src/PKGBUILD is the source of truth for which names exist.
+#
+#  Deletions go through `repo-remove`, never a bare `rm`, so the database and the
+#  filesystem move together — unlinking an indexed archive is how a client ends up
+#  with a database entry that 404s.
+#
+#  DRY-RUN BY DEFAULT. A run with no arguments reports what it would remove and
+#  touches nothing; tick `dry_run` off to actually delete and push.
+# ==============================================================================
+name: clean-gh-pages
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Report what would be removed; delete nothing and push nothing'
+        required: false
+        default: true
+        type: boolean
+      drop_unknown:
+        description: 'Drop packages whose name src/PKGBUILD no longer produces (renames, stray -debug builds)'
+        required: false
+        default: true
+        type: boolean
+      extra_patterns:
+        description: 'Also remove files matching these globs (space separated), e.g. lemonade-server-next-2025.*'
+        required: false
+        default: ''
+        type: string
+  # Opt in to a weekly sweep by un-commenting, or wire it to build-and-publish with:
+  #   on: { workflow_run: { workflows: [build-and-publish], branches: [main], types: [completed] } }
+  # schedule:
+  #   - cron: "0 18 * * 3"
+
+env:
+  REPO_NAME: lemonade # must match the [repo] header users write in pacman.conf
+  PAGES_DIR: arch
+  ARCH: x86_64
+  PKGEXT: '.pkg.tar.zst'
+  REMOTE: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+  DROP_UNKNOWN: ${{ github.event.inputs.drop_unknown }}
+  EXTRA_PATTERNS: ${{ github.event.inputs.extra_patterns }}
+  DRY_RUN: ${{ github.event.inputs.dry_run }}
+  GIT_TERMINAL_PROMPT: "0"
+  GIT_PAGER: cat
+
+# The same group as build-and-publish: a publish that commits packages and a prune that
+# deletes them must never run against the same gh-pages tip at the same time.
+concurrency:
+  group: arch-repo-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: write # required to push the gh-pages branch
+
+jobs:
+  clean:
+    name: prune leftover builds from gh-pages
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: ghcr.io/archlinux/archlinux:latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Install the Arch repo tooling
+        run: |
+          set -euo pipefail
+          pacman -Sy --noconfirm archlinux-keyring
+          # pacman-contrib is what provides repo-remove; bsdtar ships with libarchive.
+          pacman -Su --noconfirm --needed pacman-contrib git
+
+      - name: Check out ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Native git, as in build-and-publish: JS actions need a Node.js runtime, which
+          # the Arch image does not carry. This checkout is read-only — only src/PKGBUILD is
+          # looked at, to learn which package names are still real.
+          git init -q src
+          git -C src remote add origin "$REMOTE"
+          git -C src fetch -q --depth 1 origin "$GITHUB_REF"
+          git -C src checkout -q --detach FETCH_HEAD
+          git -C src log --oneline -1
+          [[ -f src/PKGBUILD ]] \
+            || { echo "::error::src/PKGBUILD is missing — the name list cannot be derived."; exit 1; }
+
+      - name: Restore the tree currently published on GitHub Pages
+        run: |
+          set -euo pipefail
+          if ! git ls-remote --exit-code --heads "$REMOTE" gh-pages > /dev/null 2>&1; then
+            echo "No gh-pages branch yet — there is nothing published to clean."
+            exit 1
+          fi
+          git clone -q --depth 1 --branch gh-pages "$REMOTE" site
+          touch site/.nojekyll
+          if ! compgen -G "site/$PAGES_DIR/*/$REPO_NAME.db.tar.gz" > /dev/null; then
+            echo "::error::no $REPO_NAME database under site/$PAGES_DIR/ — nothing to clean."
+            exit 1
+          fi
+          echo "Published tree:"
+          find site -path site/.git -prune -o -type f -print | sort
+
+      # ----------------------------------------------------------------------------
+      #  Which package names are still legitimate?
+      #
+      #  Read from the PKGBUILD instead of hard-coding, so this workflow keeps working
+      #  through the next rename. That is every `pkgname=` entry plus every
+      #  `package_<name>()` split function.
+      #
+      #  The `!debug` half matters: makepkg peels a <name>-debug package off every
+      #  package unless options says otherwise, so while `!debug` is set a
+      #  lemonade-*.pkg.tar.zst has no possible origin and is by definition debris,
+      #  while the moment somebody drops `!debug` those same files become legitimate
+      #  output that must not be pruned. Deriving the answer from the PKGBUILD is what
+      #  makes this workflow correct in both worlds without anyone editing it.
+      # ----------------------------------------------------------------------------
+      - name: Work out which package names are still built
+        id: names
+        run: |
+          set -euo pipefail
+          awk '
+            /^[[:space:]]*#/ { next }
+            /^[[:space:]]*pkgname\+?=\(/ { flag = 1 }
+            flag {
+              line = $0
+              gsub(/[()]/, " ", line)
+              for (i = 2; i <= NF; i++)
+                if (line[i] ~ /^[A-Za-z0-9@._+-]+$/) { print line[i]; seen[line[i]] = 1 }
+              if ($0 ~ /\)/) { flag = 0 }
+            }
+            /^[[:space:]]*package_[A-Za-z0-9@._+-]+\(\)/ {
+              n = $0
+              sub(/^[[:space:]]*package_/, "", n)
+              sub(/\(\).*/, "", n)
+              if (!(n in seen)) { print n; seen[n] = 1 }
+            }
+          ' src/PKGBUILD > "$RUNNER_TEMP/base-names"
+
+          # options=(...) may span lines; join it before looking for !debug.
+          opts="$(awk '
+            /^[[:space:]]*#/ { next }
+            /^[[:space:]]*(default_)?options\+?=\(/ { flag = 1 }
+            flag { buf = buf " " $0 }
+            flag && /\)/ { flag = 0 }
+            END { print buf }
+          ' src/PKGBUILD)"
+
+          cp "$RUNNER_TEMP/base-names" "$RUNNER_TEMP/known-names"
+          if [[ $opts == *'!debug'* ]]; then
+            echo "options carries '!debug' — makepkg emits no debug packages, so any"
+            echo "'-debug' archive on the page is leftover from an earlier build."
+          else
+            echo "options has no '!debug' — <name>-debug packages are legitimate output."
+            sed 's/$/-debug/' "$RUNNER_TEMP/base-names" >> "$RUNNER_TEMP/known-names"
+          fi
+          sort -u -o "$RUNNER_TEMP/known-names" "$RUNNER_TEMP/known-names"
+
+          echo "Names this PKGBUILD can produce:"
+          sed 's/^/  /' "$RUNNER_TEMP/known-names"
+
+      # ----------------------------------------------------------------------------
+      #  Plan and, unless this is a dry run, apply.
+      #
+      #  A .pkg.tar.zst filename is <name>-<pkgver>-<pkgrel>-<arch>.pkg.tar.zst, and
+      #  pkgver/pkgrel may not contain a hyphen (makepkg's validverchars is
+      #  a-zA-Z0-9_.+~), so peeling the fields off from the right is unambiguous even
+      #  for a name like lemonade-server-next.
+      # ----------------------------------------------------------------------------
+      - name: Find and remove leftovers
+        id: prune
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          # Publish this decision, not the raw input: workflow_dispatch sends 'true'/'false'
+          # but a schedule or workflow_run trigger sends the inputs object with the fields
+          # simply absent, and every reader below has to agree with what this step actually
+          # did — a step that planned a dry run must never be followed by one that pushes.
+          if [[ ${DRY_RUN:-true} == 'false' ]]; then
+            echo 'dry_run=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'dry_run=true' >> "$GITHUB_OUTPUT"
+          fi
+
+          known="$RUNNER_TEMP/known-names"
+          listed="$RUNNER_TEMP/listed"
+          removed=0
+          bytes=0
+          summary="$RUNNER_TEMP/summary"
+          : > "$summary"
+
+          read -r -a extra <<< "${EXTRA_PATTERNS:-}" || true
+
+          for db in site/"$PAGES_DIR"/*/"$REPO_NAME".db.tar.gz; do
+            [[ -f $db ]] || continue
+            dir="${db%/*}"
+            arch="${dir##*/}"
+            echo "::group::site/$PAGES_DIR/$arch"
+
+            # %FILENAME% is followed by the archive pacman will be told to download.
+            LC_ALL=C bsdtar -xOf "$db" \
+              | awk '/^%FILENAME%$/{getline; if (length) print}' | sort > "$listed"
+            echo "database indexes $(wc -l < "$listed") package(s)"
+
+            dead=()       # archives to unlink
+            gone=()       # package names to repo-remove
+            kept_name=()  # archives staying, with the name they parse back to
+            kept_file=()
+            for f in "$dir"/*.pkg.tar.*; do
+              [[ -e $f ]] || continue
+              [[ $f == *.sig ]] && continue
+              n="${f##*/}"
+
+              # Peel the filename from the right: .pkg.tar.zst, then -<arch>, -<pkgrel>,
+              # -<pkgver>. pkgver and pkgrel contain no hyphen (makepkg's validverchars is
+              # a-zA-Z0-9_.+~), so what is left is the package name, dashes and all — this
+              # is what tells lemonade-server-next from lemonade-server and from
+              # lemonade-debug. If the tail does not look like a version, the name is not
+              # recoverable, so leave the name check to itself and rely on the index.
+              stem="${n%%.pkg.tar.*}"                    # name-ver-rel-arch
+              farch="${stem##*-}"                        # x86_64
+              rest="${stem%"-$farch"}"                    # name-ver-rel
+              rel="${rest##*-}"
+              rest="${rest%"-$rel"}"                      # name-ver
+              ver="${rest##*-}"
+              name="${rest%"-$ver"}"
+              if [[ $farch != "$arch" ]]; then
+                echo "  note  $n carries arch '${farch}' but lives in $arch/"
+              fi
+              if [[ ! $ver =~ ^[0-9][A-Za-z0-9._+~]*$ || ! $rel =~ ^[0-9][A-Za-z0-9._+~]*$ ]]; then
+                echo "  note  $n does not parse as <name>-<ver>-<rel>-${farch}; not name-matching it"
+                name=""
+              fi
+
+              reason=""
+              for pat in "${extra[@]+"${extra[@]}"}"; do
+                # shellcheck disable=SC2053  # right-hand side is a glob on purpose
+                [[ $n == $pat ]] && reason="matched the '${pat}' pattern" && break
+              done
+              if [[ -z $reason ]] && ! grep -qxF -- "$n" "$listed"; then
+                reason="on disk but not indexed by $(basename "$db")"
+              fi
+              if [[ -z $reason && -n $name && ${DROP_UNKNOWN:-true} == 'true' ]] \
+                 && ! grep -qxF -- "$name" "$known"; then
+                reason="'${name}' is not produced by src/PKGBUILD"
+              fi
+              if [[ -z $reason ]]; then
+                echo "  keep  $n"
+                kept_name+=("$name"); kept_file+=("$f")
+                continue
+              fi
+
+              echo "  drop  $n — $reason"
+              printf -- '- `%s` (%s)\n' "$n" "$reason" >> "$summary"
+              dead+=("$f")
+              # Only a name the database actually knows about needs repo-remove.
+              if [[ -n $name ]] && grep -qxF -- "$n" "$listed"; then
+                gone+=("$name")
+              fi
+              bytes=$(( bytes + $(stat -c%s "$f") ))
+            done
+
+            if (( ${#dead[@]} == 0 )); then
+              echo "  nothing to remove"
+              echo "::endgroup::"
+              continue
+            fi
+            removed=$(( removed + ${#dead[@]} ))
+            # Two versions of the same name can be planned at once; repo-remove takes the
+            # whole name, so it only needs asking once.
+            if (( ${#gone[@]} > 0 )); then
+              mapfile -t gone < <(printf '%s\n' "${gone[@]}" | sort -u)
+            fi
+
+            if [[ ${DRY_RUN:-true} != 'false' ]]; then
+              echo "  dry run — left in place"
+              echo "::endgroup::"
+              continue
+            fi
+
+            # Database first, files second: at no point does the published database point
+            # at a file that is not there. repo-remove rewrites both the .db and .files
+            # databases and refreshes the lemonade.db / lemonade.files symlinks.
+            for name in "${gone[@]+"${gone[@]}"}"; do
+              echo "  repo-remove $(basename "$db") $name"
+              LC_ALL=C repo-remove -q "$db" "$name"
+              # repo-remove takes the whole name at once. When only some versions of it
+              # were selected — an extra_patterns glob, say — put the survivors back.
+              survivors=()
+              for i in "${!kept_name[@]}"; do
+                [[ ${kept_name[$i]} == "$name" ]] && survivors+=("${kept_file[$i]}")
+              done
+              if (( ${#survivors[@]} > 0 )); then
+                echo "  repo-add  $(basename "$db") ${#survivors[@]} surviving ${name} archive(s)"
+                LC_ALL=C repo-add -p -q "$db" "${survivors[@]}"
+              fi
+            done
+            for f in "${dead[@]}"; do
+              rm -f -- "$f" "$f.sig"
+            done
+            echo "::endgroup::"
+          done
+
+          # Signatures whose package no longer exists, and repo-add/repo-remove backups.
+          # (-delete implies -depth, which silently disables -prune, so .git is excluded
+          # with -not -path instead.)
+          if [[ ${DRY_RUN:-true} == 'false' ]]; then
+            find site -not -path '*/.git/*' -name '*.old' -print -delete
+          else
+            find site -not -path '*/.git/*' -name '*.old' -print \
+              | grep . && echo "  ^^ database backups that would be deleted" || true
+          fi
+          for s in site/"$PAGES_DIR"/*/*.sig; do
+            [[ -e $s ]] || continue
+            [[ -e "${s%.sig}" ]] && continue
+            echo "  drop  ${s##*/} — its package is gone"
+            [[ ${DRY_RUN:-true} == 'false' ]] && rm -f -- "$s"
+          done
+
+          act='Would remove'
+          [[ ${DRY_RUN:-true} == 'false' ]] && act='Removed'
+          {
+            echo "## gh-pages prune"
+            echo
+            if [[ -s $summary ]]; then
+              echo "${act} ${removed} file(s), $(numfmt --to=iec --suffix=B -- "$bytes")"
+              echo
+              cat "$summary"
+            else
+              echo "Nothing to remove — the published tree matches this PKGBUILD."
+            fi
+            if [[ ${DRY_RUN:-true} != 'false' ]]; then
+              echo
+              echo "_Dry run: nothing was deleted and nothing was pushed._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify the database against the published files
+        if: ${{ steps.prune.outputs.dry_run != 'true' }}
+        run: |
+          set -euo pipefail
+          status=0
+          for db in site/"$PAGES_DIR"/*/"$REPO_NAME".db.tar.gz; do
+            [[ -f $db ]] || continue
+            dir="${db%/*}"
+            mapfile -t listed < <(LC_ALL=C bsdtar -xOf "$db" \
+              | awk '/^%FILENAME%$/{getline; if (length) print}' | sort)
+            echo "$(basename "$db") lists ${#listed[@]} package(s):"
+            for f in "${listed[@]}"; do
+              if [[ -f "$dir/$f" ]]; then
+                echo "  ok  $f"
+              else
+                echo "::error::$f is listed in the database but is missing from ${dir#site/}"
+                status=1
+              fi
+            done
+            for f in "$dir"/*.pkg.tar.*; do
+              [[ -e $f ]] || continue
+              [[ $f == *.sig ]] && continue
+              if ! printf '%s\n' "${listed[@]}" | grep -qxF -- "${f##*/}"; then
+                echo "::error::${f##*/} is on disk but no database entry points at it"
+                status=1
+              fi
+            done
+          done
+          exit $status
+
+      # Byte-for-byte the page build-and-publish renders, so pruning never leaves a
+      # download link pointing at a file that has just been deleted.
+      - name: Re-render the Pages index
+        if: ${{ steps.prune.outputs.dry_run != 'true' }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          base="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+          {
+            echo '<!doctype html>'
+            echo '<html lang="en"><head><meta charset="utf-8">'
+            echo "<title>${REPO_NAME} — unofficial Arch Linux repository</title>"
+            echo '<style>body{font-family:system-ui,sans-serif;max-width:52rem;margin:2rem auto;padding:0 1rem}'
+            echo 'pre{background:#f4f4f4;padding:.75rem;overflow-x:auto}h2{margin-top:2rem}</style></head><body>'
+            echo "<h1>${REPO_NAME}</h1>"
+            echo "Unofficial Arch Linux repository for <code>lemonade-server-next</code>."
+            echo "<p>Add this to <code>/etc/pacman.conf</code>, then run <code>sudo pacman -Sy</code>:</p>"
+            printf '<pre>[%s]\nServer = %s/%s/$arch\nSigLevel = Never</pre>\n' \
+              "$REPO_NAME" "$base" "$PAGES_DIR"
+            echo '<h2>Packages</h2>'
+            for d in "site/$PAGES_DIR"/*/; do
+              a="$(basename "$d")"
+              echo "<h3>${a}</h3><ul>"
+              for f in "$d"*.pkg.tar.*; do
+                n="${f##*/}"
+                if [[ "$n" == *.sig ]]; then continue; fi
+                printf '<li><a href="%s">%s</a> (%s)</li>\n' "$a/$n" "$n" \
+                  "$(numfmt --to=iec --suffix=B -- "$(stat -c%s "$f")")"
+              done
+              echo '</ul>'
+            done
+            echo "<p>Rebuilt by GitHub Actions from <code>${GITHUB_REF_NAME}</code>.</p>"
+            echo '</body></html>'
+          } > "site/index.html"
+          echo "wrote site/index.html"
+
+      - name: Publish to GitHub Pages (gh-pages branch)
+        if: ${{ steps.prune.outputs.dry_run != 'true' }}
+        run: |
+          set -euo pipefail
+          cd site
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Published tree is unchanged — nothing to push."
+          else
+            git status --short
+            git commit -q \
+              -m "arch: prune leftover builds from ${REPO_NAME} repository [skip ci]" \
+              -m "source: ${GITHUB_REF_NAME} @ ${GITHUB_SHA}" \
+              -m "run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            git push -q origin 'HEAD:refs/heads/gh-pages'
+            echo "Pushed gh-pages."
+          fi
