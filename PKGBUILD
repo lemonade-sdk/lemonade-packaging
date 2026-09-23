@@ -16,8 +16,8 @@ pkgdesc='Lemonade helps users discover and run local AI apps by serving optimize
 # cut is a new candidate .<number>, starting at 0. The build-and-publish workflow rewrites
 # these two variables (and the b2sums below) on its weekly run; edit them by hand to build
 # a different candidate.
-DATE=2026.39
-COMMITS=1
+DATE=2026.40
+COMMITS=0
 LEMONADE_RELEASE_BRANCH=release-v${DATE}
 pkgver=${DATE}.${COMMITS}
 pkgrel=1
